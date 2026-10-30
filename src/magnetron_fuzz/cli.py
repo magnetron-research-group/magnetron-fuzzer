@@ -31,7 +31,7 @@ from .worker import CASE, CASES, FINDINGS, HB, INTERNAL, NSLOT, OPNAME, PID, STA
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog='magnetron-fuzz', description='Differential fuzzer: random magnetron op sequences checked against torch.')
-    ap.add_argument('-j', '--jobs', type=int, default=None, help='worker processes (default: all cores; 16 with --device cuda)')
+    ap.add_argument('-j', '--jobs', type=int, default=None, help='worker processes (default: all cores; 4 with --device cuda)')
     ap.add_argument('--device', default='cpu', choices=('cpu', 'cuda'), help='cuda: also run every step on magnetron cuda and check it against torch (and magnetron cpu)')
     ap.add_argument('--threads', default='1,1,1,1,1,1,1,4', help='MAG_CPU_THREADS per worker, cycled over workers (default: mostly 1, every 8th worker 4)')
     ap.add_argument('--seed', default=None, help='base seed (default: random)')
@@ -167,7 +167,7 @@ class Supervisor:
         self.run_dir = Path(a.out).resolve() / time.strftime(f'%Y%m%d-%H%M%S-s{self.seed}')
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.cfg = make_config(a, self.seed, str(self.run_dir))
-        self.jobs = max(1, a.jobs or (16 if a.device == 'cuda' else os.cpu_count() or 1))  # one CUDA context per worker
+        self.jobs = max(1, a.jobs or (4 if a.device == 'cuda' else os.cpu_count() or 1))  # each worker holds its own CUDA context
         cycle = [max(0, int(x)) for x in a.threads.split(',') if x.strip()] or [1]
         self.threads = [cycle[w % len(cycle)] for w in range(self.jobs)]
         # Blocking launches attribute a crash to the op that caused it; some workers stay async to fuzz the async stream.

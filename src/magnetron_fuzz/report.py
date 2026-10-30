@@ -50,9 +50,10 @@ def api_diff(category: str, op: str, msg: str, ins: list, step) -> bool:  # noqa
         if len(dts) > 1 and 0 in ranks and any(r > 0 for r in ranks):
             return True
         # mixed-dtype comparisons: magnetron and torch promote int/half pairs differently (no NaN/precision issue on one side)
-        if category == 'mismatch' and len(dts) > 1 and re.fullmatch(r'r?(lt|le|gt|ge|eq|ne)', op):
+        if category == 'mismatch' and len(dts) > 1 and re.fullmatch(r'r?(lt|le|gt|ge|eq|ne)(@\w+)?', op):
             return True
-    return any(c == category and re.search(o, op) and re.search(m, msg) for c, o, m in KNOWN_API_DIFFS)
+    base_op = op.split('@', 1)[0]  # 'sum@cuda' follows the same rules as 'sum'
+    return any(c == category and re.search(o, base_op) and re.search(m, msg) for c, o, m in KNOWN_API_DIFFS)
 
 
 def slug(s: str) -> str:

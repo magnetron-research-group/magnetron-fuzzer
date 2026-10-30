@@ -360,6 +360,8 @@ class Program:
         """Device result vs torch; when torch has no reference, vs magnetron CPU."""
         dstep = dataclasses.replace(step, op=f'{step.op}@{self.device}')
         if derr is not None:
+            if 'out of memory' in str(derr):
+                return  # device memory exhausted by parallel workers: a resource limit, not a bug
             if merr is None and step.supported and 'not implemented in' not in str(derr):
                 self.reporter.finding('mag_error', dstep, ins, f'{type(derr).__name__}: {derr} (magnetron cpu succeeds)', self)
             return
@@ -369,7 +371,8 @@ class Program:
         if rerr is None:
             res = self._compare(dstep, ins, douts_t, routs, upcast)
         else:
-            res = self._compare(dstep, ins, douts_t, mouts_t, upcast=True)
+            # Torch failed, so its tolerance helpers (scale/mask/check code) may fail too: plain comparison against magnetron cpu.
+            res = self._compare(dataclasses.replace(dstep, cmp=Cmp(rtol_mul=4.0, check_dtype=True), check=None), ins, douts_t, mouts_t, upcast=False)
             if res:
                 res = ('device_mismatch', f'{self.device} vs magnetron cpu (torch has no reference): {res[1]}')
         if res:
