@@ -1,0 +1,24 @@
+[project]
+name = "magnetron-fuzz"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Mario Sieg", email = "mario.sieg.64@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "magnetron>=0.2.2",
+    "torch>=2.15.0",
+]
+
+[project.scripts]
+magnetron-fuzz = "magnetron_fuzz:main"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+# Use the local checkout until the next magnetron release.
+magnetron = { path = "../magnetron", editable = true }
