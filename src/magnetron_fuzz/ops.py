@@ -429,7 +429,9 @@ def edge_rhs(g: Gen, name: str, t: torch.Tensor) -> torch.Tensor:
     flat = t.reshape(-1).clone()
     for _ in range(g.randint(1, max(1, min(flat.numel(), 6)))):
         e = g.choice(edges)
-        flat[g.randint(0, flat.numel() - 1)] = torch.tensor(e, dtype=torch.int64).view(torch.uint64) if t.dtype == torch.uint64 else e
+        if t.dtype == torch.uint64:  # store the uint64 bit pattern through int64
+            e = torch.tensor(e - 2**64 if e >= 2**63 else e, dtype=torch.int64).view(torch.uint64)
+        flat[g.randint(0, flat.numel() - 1)] = e
     return flat.reshape(t.shape)
 
 

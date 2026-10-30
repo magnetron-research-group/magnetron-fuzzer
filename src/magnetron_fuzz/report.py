@@ -41,7 +41,7 @@ def normalize_message(msg: str) -> str:
 
 
 def replay_command(seed: str, threads: int) -> str:
-    return f'MAG_CPU_THREADS={threads} uv run magnetron-fuzz --replay {seed} -v'
+    return f'MAG_LAUNCH_BLOCKING=1 MAG_CPU_THREADS={threads} .venv/bin/python -m magnetron_fuzz --replay {seed} -v'
 
 
 def append_index(run_dir: Path, rec: dict) -> None:
@@ -83,9 +83,9 @@ class Reporter:
         dts = [str(v.dt).removeprefix('torch.') for v in ins]
         if step is not None:
             dts += [str(t.dtype).removeprefix('torch.') for t in step.aux.values()]
-        layout = ins[0].layout() if ins else '-'
-        detail = normalize_message(msg) if category in ('mag_error', 'dtype', 'shape', 'structure', 'invariant') else ''
-        sig = f'{category}|{op}|{",".join(dict.fromkeys(dts))}|{layout}|{detail}'
+        # Coarse on purpose: one finding per distinct failure, not per input layout.
+        detail = normalize_message(msg) if category in ('mag_error', 'dtype', 'shape', 'structure', 'invariant', 'accepts_invalid') else ''
+        sig = f'{category}|{op}|{dts[0] if dts else "-"}|{detail}'
         key = hashlib.sha1(sig.encode()).hexdigest()[:10]
         if self.verbose:
             print(f'\n=== {category} in {op} (step {prog.step_idx}) ===\n{msg}\n')

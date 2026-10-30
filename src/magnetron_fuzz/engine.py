@@ -243,8 +243,8 @@ class Program:
 
     # -- execution --------------------------------------------------------------------------------
 
-    def _code(self, step: Step, code: str) -> str:
-        names = [self.pool[i].name for i in step.args]
+    def _code(self, ins: list[Var], code: str) -> str:
+        names = [v.name for v in ins]
         return re.sub(r'\bx(\d+)\b', lambda mo: names[int(mo.group(1))] if int(mo.group(1)) < len(names) else mo.group(0), code)
 
     def run(self, step: Step) -> Outcome:
@@ -253,7 +253,7 @@ class Program:
         if step.kind in ('inplace', 'smoke_inplace'):
             _, diff = self.family(ins[0])
             self.drop(diff)
-        self.trace.append(f'[{self.step_idx}] {self._code(step, step.mag)}'.replace('\n', '; '))
+        self.trace.append(f'[{self.step_idx}] {self._code(ins, step.mag)}'.replace('\n', '; '))
         if self.hooks:
             self.hooks.before_mag(self, step, ins)
 

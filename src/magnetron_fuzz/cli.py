@@ -43,6 +43,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument('--p-big', type=float, default=0.04, help='probability a shape uses the big budget')
     ap.add_argument('--ops', default=None, help='regex: only fuzz op families matching (e.g. "unary|binary")')
     ap.add_argument('--skip-ops', default=None, help='regex: skip op families matching')
+    ap.add_argument('--async-every', type=int, default=4, help='every Nth worker runs with async CPU execution (crash attribution is approximate there); 0 = none')
     ap.add_argument('--timeout', type=float, default=60, help='seconds without progress before a worker is considered hung')
     ap.add_argument('--no-replay', action='store_true', help='do not replay crashes to produce repro scripts')
     ap.add_argument('--replay', metavar='SEED', help='replay one case (seed from a finding) in this process')
@@ -114,6 +115,8 @@ class Supervisor:
         self.jobs = max(1, a.jobs)
         cycle = [max(0, int(x)) for x in a.threads.split(',') if x.strip()] or [1]
         self.threads = [cycle[w % len(cycle)] for w in range(self.jobs)]
+        # Blocking launches attribute a crash to the op that caused it; some workers stay async to fuzz the async stream.
+        self.blocking = [not (a.async_every and w % a.async_every == a.async_every - 1) for w in range(self.jobs)]
         self.ctx = mp.get_context('spawn')
         self.shm = self.ctx.Array('q', self.jobs * NSLOT, lock=False)
         self.opbuf = self.ctx.Array('c', self.jobs * OPNAME, lock=False)
@@ -126,8 +129,12 @@ class Supervisor:
         self.t0 = time.monotonic()
 
     def spawn(self, w: int, start_idx: int) -> None:
-        cfg = Config(**{**self.cfg.__dict__, 'threads': self.threads[w]})
+        cfg = Config(**{**self.cfg.__dict__, 'threads': self.threads[w], 'launch_blocking': self.blocking[w]})
         os.environ['MAG_CPU_THREADS'] = str(self.threads[w])
+        if self.blocking[w]:
+            os.environ['MAG_LAUNCH_BLOCKING'] = '1'
+        else:
+            os.environ.pop('MAG_LAUNCH_BLOCKING', None)
         p = self.ctx.Process(target=worker_main, args=(w, cfg, self.shm, self.opbuf, self.stop, start_idx), daemon=True, name=f'fuzz{w}')
         p.start()
         self.shm[w * NSLOT + HB] = time.monotonic_ns() // 1_000_000
@@ -199,7 +206,7 @@ class Supervisor:
         except ValueError:
             sig = f'signal{-code}'
         fault = (self.run_dir / 'logs' / f'worker{w}.fault').read_text(errors='replace') if (self.run_dir / 'logs' / f'worker{w}.fault').exists() else ''
-        self.record_abort('crash', sig, w, seed, step, op, fault)
+        self.record_abort('crash', sig if self.blocking[w] else f'{sig} async', w, seed, step, op, fault)
 
     def on_hang(self, w: int) -> None:
         seed, step, op = self.worker_state(w)
@@ -234,7 +241,7 @@ class Supervisor:
 
     def confirm(self, d: Path, k: int, seed: str, step: int, threads: int, category: str) -> None:
         """Re-run the case in a fresh process: confirms reproducibility and writes a single-op repro script."""
-        env = {**os.environ, 'MAG_CPU_THREADS': str(threads), 'PYTHONFAULTHANDLER': '1'}
+        env = {**os.environ, 'MAG_CPU_THREADS': str(threads), 'PYTHONFAULTHANDLER': '1', 'MAG_LAUNCH_BLOCKING': '1'}
         cmd = [sys.executable, '-m', 'magnetron_fuzz', '--replay', seed, '--dump-step', str(step), '--dump-dir', str(d), *self.forwarded_args()]
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=max(120, 3 * self.a.timeout))

@@ -42,6 +42,7 @@ class Config:
     max_cases: int = 0
     check_every: float = 0.1
     threads: int = 1
+    launch_blocking: bool = True
     extra: dict = field(default_factory=dict)
 
 
