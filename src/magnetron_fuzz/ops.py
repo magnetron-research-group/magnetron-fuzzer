@@ -87,7 +87,7 @@ def bshape(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...] | None:
 
 def corrupt_index(g: Gen, ix: torch.Tensor, size: int) -> tuple[torch.Tensor, bool]:
     """Sometimes plant out-of-range indices (size, -size-1, huge) to probe bounds checking."""
-    if not ix.numel() or not g.chance(0.08):
+    if not ix.numel() or not size or not g.chance(0.08):  # torch skips validation when nothing is gathered
         return ix, False
     flat = ix.reshape(-1).clone()
     flat[g.randint(0, flat.numel() - 1)] = g.choice((size, size + 1, -size - 1, 2**31, -(2**31), 2**62, -(2**63)))
@@ -106,6 +106,16 @@ def maybe_permuted_aux(g: Gen, step_aux: dict, name: str, t: torch.Tensor) -> st
 
 
 def scalar_for(g: Gen, dt: torch.dtype) -> object:
+    v = _scalar_for(g, dt)
+    if dt in FP and isinstance(v, float) and math.isfinite(v):
+        # torch keeps Python scalars in full precision, magnetron rounds them to the tensor dtype first (API difference): use exact values
+        v = float(torch.tensor(v, dtype=torch.float64).to(dt).double())
+        if not math.isfinite(v):
+            v = 1.0
+    return v
+
+
+def _scalar_for(g: Gen, dt: torch.dtype) -> object:
     if dt == torch.bool:
         return g.chance(0.5) if g.chance(0.7) else g.int_scalar(0, 3)
     if dt in FP:
@@ -196,6 +206,8 @@ def view_ops(p: Program) -> Step | None:
         return view_step(p, which, i, f'.{which}({a}, {b})')
     if which == 'permute' and r >= 1:
         return view_step(p, 'permute', i, f'.permute({", ".join(map(str, g.perm(r)))})')
+    if which == 'view' and not same_layout(v):
+        which = 'reshape'  # view succeeds or fails depending on strides, which may legitimately differ between the libraries
     if which in ('reshape', 'view'):
         new = g.factorize(v.numel, g.randint(0, 5) if v.numel == 1 else g.randint(1, 5))
         if new and v.numel and g.chance(0.3):
@@ -286,6 +298,11 @@ def view_ops(p: Program) -> Step | None:
     return None
 
 
+def same_layout(v: Var) -> bool:
+    """Both libraries hold v with the same strides (size-1 dims excluded, their stride is never used)."""
+    return all(a == b for a, b, d in zip(v.m.strides, v.t.stride(), v.shape) if d != 1)
+
+
 def basic_index(g: Gen, shape: tuple[int, ...]) -> str:
     """Random NumPy-style basic index (ints, slices, Ellipsis, None) for `shape`."""
     parts = []
@@ -340,7 +357,10 @@ def reinterpret_view(p: Program) -> Step | None:
     if i is None:
         return None
     v = p.pool[i]
-    same = [d for d in ALL if ITEMSIZE[d] == ITEMSIZE[v.dt] and d != v.dt]
+    # Never reinterpret as bool: arbitrary bytes are not valid bools (only 0/1), and torch normalizes them on copy.
+    if v.dt == torch.bool:  # writes through a byte view would create invalid bools
+        return None
+    same = [d for d in ALL if ITEMSIZE[d] == ITEMSIZE[v.dt] and d != v.dt and d != torch.bool]
     if not same:
         return None
     to = g.choice(same)
@@ -459,12 +479,14 @@ def binary(p: Program) -> Step | None:
         rhs = lit(s)
         if not inplace and g.chance(0.25) and name not in COMPARE:
             # reflected: scalar op tensor
-            return Step(f'r{name}', args, f'r = {rhs} {sym} x0', f'r = binf(lambda a, b: a {sym} b, {rhs}, x0)', supported=supported)
+            return Step(f'r{name}', args, f'r = ({rhs}) {sym} x0', f'r = binf(lambda a, b: a {sym} b, {rhs}, x0)', supported=supported, cmp=shift_cmp(name, x.dt, rhs, reflected=True))
     elif c < 0.5:
         # pool operand
         def compatible(v: Var) -> bool:
-            out = bshape(x.shape, v.shape)
-            return out is not None and (not inplace or out == x.shape)
+            out = bshape(x.shape, v.shape)  # two pool tensors can broadcast to something enormous: cap it
+            if inplace and v is not x and v.mstore() == x.mstore():
+                return False  # writing x while reading a differently-laid-out alias of it is undefined (torch rejects it)
+            return out is not None and (not inplace or out == x.shape) and numel(out) <= 4 * g.big_numel
 
         j = p.pick(compatible)
         if j is None:
@@ -478,12 +500,25 @@ def binary(p: Program) -> Step | None:
     ref = f'r = binf(lambda a, b: a {sym} b, x0, {rhs})'
     if name in COMPARE:
         ref = f'r = x0 {sym} {rhs}'
+    cmp = shift_cmp(name, x.dt, rhs)
     if inplace:
         form = g.choice(('method', 'dunder'))
         mag = f'r = x0.{name}_({rhs})' if form == 'method' else f'x0 {INPLACE_DUNDER[name]} {rhs}\nr = x0'
-        return Step(f'{name}_', args, mag, ref, kind='inplace', aux=aux, supported=supported)
+        return Step(f'{name}_', args, mag, ref, kind='inplace', aux=aux, supported=supported, cmp=cmp)
     mag = f'r = x0.{name}({rhs})' if g.chance(0.4) else f'r = x0 {sym} {rhs}'
-    return Step(name, args, mag, ref, aux=aux, supported=supported)
+    return Step(name, args, mag, ref, aux=aux, supported=supported, cmp=cmp)
+
+
+def shift_cmp(name: str, dt: torch.dtype, rhs: str, reflected: bool = False) -> Cmp:
+    """Shifts by < 0 or >= bits are deliberately defined as 0 in magnetron (torch sign-fills): only compare in-range amounts."""
+    if name not in ('lshift', 'rshift') or dt not in INTS:
+        return Cmp()
+    amount = 'x0' if reflected else rhs
+    bits = torch.iinfo(dt).bits
+    if not reflected and not rhs[0].isalpha():  # Python literal (may not even fit int64)
+        v = eval(rhs)
+        return Cmp(mask=f'm = torch.full(torch.as_tensor(x0).shape, {0 <= v < bits})')
+    return Cmp(mask=f'_a = torch.as_tensor({amount}).to(torch.int64)\nm = ((_a >= 0) & (_a < {bits})).expand(torch.broadcast_shapes(_a.shape, torch.as_tensor(x0).shape))')
 
 
 @op('minmax_elementwise', 2.0)
@@ -642,7 +677,7 @@ def getitem_adv(p: Program) -> Step | None:
     d = g.randint(0, x.rank - 1) if g.chance(0.4) else 0
     if not x.shape[d]:
         return None
-    ix, bad = corrupt_index(g, g.index(x.shape[d], (g.randint(0, 8),)), x.shape[d])
+    ix, bad = corrupt_index(g, g.index(x.shape[d], (g.randint(0, 8),)), x.shape[d] if x.numel else 0)
     pre = ':, ' * d
     return Step('getitem(int)', [i], f'r = x0[{pre}ix]', f'r = x0[{pre}ix]', aux={'ix': ix}, cmp=Cmp(exact=True), upcast_ok=False, invalid=bad)
 
@@ -908,7 +943,7 @@ def gather(p: Program) -> Step | None:
     ishape = tuple((g.randint(1, 2 * x.shape[k] + 1) if k == d else g.randint(1, x.shape[k])) for k in range(x.rank))
     if numel(ishape) > 4 * g.max_numel:
         return None
-    ix, bad = corrupt_index(g, g.index(x.shape[d], ishape, negative=False), x.shape[d])
+    ix, bad = corrupt_index(g, g.index(x.shape[d], ishape, negative=False), x.shape[d] if x.numel else 0)
     aux = {'ix': ix}
     return Step('gather', [i], f'r = x0.gather({dim}, ix)', f'r = torch.gather(x0, {dim}, ix)', aux=aux, cmp=Cmp(exact=True), supported=supported, invalid=bad)
 
@@ -932,7 +967,7 @@ def scatter(p: Program) -> Step | None:
     dim = norm_dim(g, x.rank)
     d = dim % x.rank
     ishape = tuple(g.randint(1, x.shape[k]) for k in range(x.rank))
-    ix, bad = corrupt_index(g, g.index(x.shape[d], ishape, negative=False) if add else unique_index(g, x.shape, d, ishape), x.shape[d])
+    ix, bad = corrupt_index(g, g.index(x.shape[d], ishape, negative=False) if add else unique_index(g, x.shape, d, ishape), x.shape[d] if x.numel else 0)
     aux = {'ix': ix, 'src': g.tensor(ishape, x.dt)}
     name = 'scatter_add' if add else 'scatter'
     cmp = Cmp(exact=not add or x.dt not in FP)
@@ -961,7 +996,7 @@ def index_add(p: Program) -> Step | None:
     alpha = g.choice((1, 1, 2, -1)) if x.dt in INTS else g.choice((1.0, 0.5, -2.0))
     if x.dt in UINTS:
         alpha = 1
-    ix, bad = corrupt_index(g, g.index(x.shape[d], (L,), negative=False), x.shape[d])
+    ix, bad = corrupt_index(g, g.index(x.shape[d], (L,), negative=False), x.shape[d] if x.numel else 0)
     aux = {'ix': ix, 'src': g.tensor(sshape, x.dt)}
     ref = f'r = torch.index_add(x0, {dim}, ix, src, alpha={alpha})'
     cmp = Cmp(exact=x.dt not in FP)
@@ -983,7 +1018,7 @@ def embedding(p: Program) -> Step | None:
     ishape = g.shape(max_rank=3, budget=256, allow_zero=True)
     if numel(ishape) * (x.numel // max(1, x.shape[0])) > 8 * g.max_numel:
         return None
-    ix, bad = corrupt_index(g, g.index(x.shape[0], ishape, negative=False), x.shape[0])
+    ix, bad = corrupt_index(g, g.index(x.shape[0], ishape, negative=False), x.shape[0] if x.numel else 0)
     if bad:
         ix = ix.abs()  # torch's x[ix] wraps negatives; embedding indices must be in [0, vocab)
     return Step('embedding', [i], 'r = x0.embedding(ix)', 'r = x0[ix]', aux={'ix': ix}, cmp=Cmp(exact=True), upcast_ok=False, invalid=bad)
@@ -1284,6 +1319,8 @@ def interpolate(p: Program) -> Step | None:
     aa = g.chance(0.3) if mode in ('bilinear', 'bicubic') else False
     mag = f"r = x.interpolate({kw}, mode='{mode}', align_corners={ac}, antialias={aa})"
     ref = f"r = F.interpolate(x.double(), {kw}, mode='{mode}', align_corners={ac if linear else None}, antialias={aa}).to(x.dtype)"
+    if mode in ('nearest', 'nearest-exact'):
+        ref = f"r = nearest(x, {kw}, mode='{mode}')"
     cmp = Cmp(scale=f"s = F.interpolate(x.double().abs(), {kw}, mode='{mode}', align_corners={ac if linear else None}, antialias={aa})", acc_k=16)
     if dt not in FP:
         cmp = Cmp(exact=True)

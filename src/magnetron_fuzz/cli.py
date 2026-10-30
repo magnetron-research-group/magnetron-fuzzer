@@ -31,7 +31,8 @@ from .worker import CASE, CASES, FINDINGS, HB, INTERNAL, NSLOT, OPNAME, PID, STA
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog='magnetron-fuzz', description='Differential fuzzer: random magnetron op sequences checked against torch.')
-    ap.add_argument('-j', '--jobs', type=int, default=os.cpu_count() or 1, help='worker processes (default: all cores)')
+    ap.add_argument('-j', '--jobs', type=int, default=None, help='worker processes (default: all cores; 16 with --device cuda)')
+    ap.add_argument('--device', default='cpu', choices=('cpu', 'cuda'), help='cuda: also run every step on magnetron cuda and check it against torch (and magnetron cpu)')
     ap.add_argument('--threads', default='1,1,1,1,1,1,1,4', help='MAG_CPU_THREADS per worker, cycled over workers (default: mostly 1, every 8th worker 4)')
     ap.add_argument('--seed', default=None, help='base seed (default: random)')
     ap.add_argument('-t', '--time', type=float, default=0, help='stop after this many seconds (0 = run until Ctrl-C)')
@@ -51,13 +52,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument('--dump-dir', default=None, help='with --replay --dump-step: where to write the repro')
     ap.add_argument('-v', '--verbose', action='store_true', help='with --replay: print every step')
     ap.add_argument('--list-ops', action='store_true', help='list op families and weights')
+    ap.add_argument('--recheck', metavar='RUN_DIR', help='replay the first example of every finding in RUN_DIR and report which still fail')
     return ap.parse_args(argv)
 
 
 def make_config(a: argparse.Namespace, seed: str, run_dir: str | None) -> Config:
     lo, hi = (int(x) for x in a.steps.split(':'))
     return Config(seed=seed, run_dir=run_dir, min_steps=lo, max_steps=hi, max_numel=a.max_numel, big_numel=a.big_numel, p_big=a.p_big,
-                  include=a.ops, exclude=a.skip_ops, max_cases=a.cases)  # fmt: skip
+                  include=a.ops, exclude=a.skip_ops, max_cases=a.cases, device=a.device)  # fmt: skip
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.replay:
         return replay(a)
+    if a.recheck:
+        return recheck(a)
     return Supervisor(a).run()
 
 
@@ -90,7 +94,7 @@ def replay(a: argparse.Namespace) -> int:
     base_seed = a.replay.rsplit('-', 2)[0]
     cfg = make_config(a, base_seed, None)
     threads = int(os.environ.get('MAG_CPU_THREADS', '0') or 0)
-    reporter = Reporter(None, a.replay, threads, verbose=True)
+    reporter = Reporter(None, a.replay, threads, verbose=True, device=a.device)
     hooks = ReplayHooks(a.dump_step, Path(a.dump_dir) if a.dump_dir else None, reporter, a.verbose)
     stats: dict = {}
 
@@ -100,6 +104,57 @@ def replay(a: argparse.Namespace) -> int:
     n = run_case(cfg, a.replay, reporter, hooks, stats, weighted_ops(a.ops, a.skip_ops), on_internal)
     print(f'replayed {n} steps, {reporter.count} findings: {reporter.by_category}')
     return 1 if reporter.count else 0
+
+
+# -- recheck --------------------------------------------------------------------------------------
+
+
+def recheck(a: argparse.Namespace) -> int:
+    """Replay one example per finding; a finding is fixed if its category no longer fires at that step."""
+    import re
+
+    run = Path(a.recheck)
+    cases = []
+    for md in sorted(run.glob('findings/*/*/ex0.md')):
+        text = md.read_text()
+        head = re.search(r'^# (\w+): (.+?)(?: \((.*)\))?$', text, re.M)
+        meta = re.search(r'seed: `([^`]+)`, step (\d+), MAG_CPU_THREADS=(\d+)', text)
+        if head and meta:
+            cases.append((md.parent, head.group(1), head.group(2), meta.group(1), int(meta.group(2)), int(meta.group(3))))
+    saved = json.loads((run / 'config.json').read_text()) if (run / 'config.json').exists() else {}
+    fwd = ['--steps', f'{saved.get("min_steps", 4)}:{saved.get("max_steps", 40)}', '--max-numel', str(saved.get('max_numel', 2048)),
+           '--big-numel', str(saved.get('big_numel', 1 << 18)), '--p-big', str(saved.get('p_big', 0.04)), '--device', saved.get('device', 'cpu')]
+    if saved.get('include'):
+        fwd += ['--ops', saved['include']]
+    if saved.get('exclude'):
+        fwd += ['--skip-ops', saved['exclude']]
+
+    def one(c: tuple) -> tuple:
+        d, cat, op, seed, step, threads = c
+        env = {**os.environ, 'MAG_CPU_THREADS': str(threads), 'MAG_LAUNCH_BLOCKING': '1'}
+        try:
+            r = subprocess.run([sys.executable, '-m', 'magnetron_fuzz', '--replay', seed, *fwd], env=env, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return c, category_still(cat, 'hang')
+        if r.returncode < 0:
+            return c, 'crash' if cat in ('crash', 'hang') else f'now crashes ({signal.Signals(-r.returncode).name})'
+        if cat in ('crash', 'hang'):
+            return c, None
+        return c, cat if f'=== {cat} in {op} (step {step})' in r.stdout else None
+
+    def category_still(cat: str, got: str) -> str | None:
+        return got if cat in ('hang',) else f'now {got}'
+
+    results = list(ThreadPoolExecutor(max_workers=max(1, a.jobs)).map(one, cases))
+    still = [(c, why) for c, why in results if why]
+    by_cat = Counter(c[1] for c, _ in results)
+    left = Counter(c[1] for c, _ in still)
+    for cat in sorted(by_cat):
+        print(f'{cat:<16} {by_cat[cat] - left[cat]:>5} fixed  {left[cat]:>5} still failing')
+    out = [{'dir': str(c[0]), 'category': c[1], 'op': c[2], 'seed': c[3], 'step': c[4], 'status': why} for c, why in still]
+    (run / 'recheck.json').write_text(json.dumps(out, indent=1))
+    print(f'{len(still)}/{len(results)} still failing, details in {run / "recheck.json"}')
+    return 1 if still else 0
 
 
 # -- supervisor -----------------------------------------------------------------------------------
@@ -112,7 +167,7 @@ class Supervisor:
         self.run_dir = Path(a.out).resolve() / time.strftime(f'%Y%m%d-%H%M%S-s{self.seed}')
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.cfg = make_config(a, self.seed, str(self.run_dir))
-        self.jobs = max(1, a.jobs)
+        self.jobs = max(1, a.jobs or (16 if a.device == 'cuda' else os.cpu_count() or 1))  # one CUDA context per worker
         cycle = [max(0, int(x)) for x in a.threads.split(',') if x.strip()] or [1]
         self.threads = [cycle[w % len(cycle)] for w in range(self.jobs)]
         # Blocking launches attribute a crash to the op that caused it; some workers stay async to fuzz the async stream.
@@ -142,7 +197,7 @@ class Supervisor:
 
     def run(self) -> int:
         a = self.a
-        print(f'magnetron-fuzz: seed {self.seed}, {self.jobs} workers, MAG_CPU_THREADS per worker cycle {a.threads}')
+        print(f'magnetron-fuzz: seed {self.seed}, {self.jobs} workers, MAG_CPU_THREADS per worker cycle {a.threads}, device {a.device}')
         print(f'run dir: {self.run_dir}')
         (self.run_dir / 'config.json').write_text(json.dumps({**self.cfg.__dict__, 'jobs': self.jobs, 'threads': self.threads, 'argv': sys.argv}, indent=2))
         for w in range(self.jobs):
@@ -206,6 +261,10 @@ class Supervisor:
         except ValueError:
             sig = f'signal{-code}'
         fault = (self.run_dir / 'logs' / f'worker{w}.fault').read_text(errors='replace') if (self.run_dir / 'logs' / f'worker{w}.fault').exists() else ''
+        log = self.run_dir / 'logs' / f'worker{w}.log'
+        if log.exists():  # assertion / bounds-check messages from a MAGNETRON_DEBUG build land here
+            tail = log.read_bytes()[-3000:].decode(errors='replace').strip()
+            fault = f'{fault}\n--- worker log tail ---\n{tail}' if tail else fault
         self.record_abort('crash', sig if self.blocking[w] else f'{sig} async', w, seed, step, op, fault)
 
     def on_hang(self, w: int) -> None:
@@ -257,7 +316,7 @@ class Supervisor:
 
     def forwarded_args(self) -> list[str]:
         a = self.a
-        out = ['--steps', a.steps, '--max-numel', str(a.max_numel), '--big-numel', str(a.big_numel), '--p-big', str(a.p_big)]
+        out = ['--steps', a.steps, '--max-numel', str(a.max_numel), '--big-numel', str(a.big_numel), '--p-big', str(a.p_big), '--device', a.device]
         if a.ops:
             out += ['--ops', a.ops]
         if a.skip_ops:

@@ -26,6 +26,34 @@ from .dtypes import ITEMSIZE, TORCH2MAG, to_torch
 
 MAX_EXAMPLES = 3
 
+# Deliberate differences from torch semantics, reported under 'api_diff' so they don't hide real bugs.
+# Each entry: (category, op regex, message regex).
+KNOWN_API_DIFFS = [
+    ('mag_error', r'^topk$', r'k must be > |requires a tensor with rank'),
+    ('mag_error', r'^transpose$', r'must be different|requires rank'),
+    ('mag_error', r'^(getitem|setitem)$', r'incompatible function arguments'),
+    ('mag_error', r'^(copy_|setitem)$', r'must have the same (shape|dtype)'),
+    ('mag_error', r'_$', r'in-place (.* )?(would change the dtype|true division is not allowed)'),
+    ('mag_error', r'^convT', r'computed output size 0'),  # torch skips the size check for an empty batch
+    ('dtype', r'^(sum|prod|cusum|cuprod|einsum.*)$', r'magnetron torch.uint64 vs torch torch.int64'),  # unsigned reductions stay unsigned
+    ('mag_error', r'^(arange|linspace)$', r'empty or invalid range|steps must be'),
+    ('mag_error', r'^broadcast$', r'expected at least one dimension'),
+]
+
+
+def api_diff(category: str, op: str, msg: str, ins: list, step) -> bool:  # noqa: ANN001
+    if category in ('dtype', 'mismatch') and step is not None:
+        ops = [(v.rank, v.dt) for v in ins] + [(t.dim(), t.dtype) for t in step.aux.values()]
+        dts = {d for _, d in ops}
+        ranks = [r for r, _ in ops]
+        # torch: 0-d tensors don't take part in type promotion against dimensioned tensors
+        if len(dts) > 1 and 0 in ranks and any(r > 0 for r in ranks):
+            return True
+        # mixed-dtype comparisons: magnetron and torch promote int/half pairs differently (no NaN/precision issue on one side)
+        if category == 'mismatch' and len(dts) > 1 and re.fullmatch(r'r?(lt|le|gt|ge|eq|ne)', op):
+            return True
+    return any(c == category and re.search(o, op) and re.search(m, msg) for c, o, m in KNOWN_API_DIFFS)
+
 
 def slug(s: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', s).strip('_')[:60] or 'op'
@@ -40,8 +68,9 @@ def normalize_message(msg: str) -> str:
     return first[:200]
 
 
-def replay_command(seed: str, threads: int) -> str:
-    return f'MAG_LAUNCH_BLOCKING=1 MAG_CPU_THREADS={threads} .venv/bin/python -m magnetron_fuzz --replay {seed} -v'
+def replay_command(seed: str, threads: int, device: str = 'cpu') -> str:
+    dev = f' --device {device}' if device != 'cpu' else ''
+    return f'MAG_LAUNCH_BLOCKING=1 MAG_CPU_THREADS={threads} .venv/bin/python -m magnetron_fuzz --replay {seed}{dev} -v'
 
 
 def append_index(run_dir: Path, rec: dict) -> None:
@@ -67,7 +96,8 @@ def claim_example_slot(d: Path) -> int | None:
 
 
 class Reporter:
-    def __init__(self, run_dir: Path | None, seed: str, threads: int, verbose: bool = False, worker: int = -1) -> None:
+    def __init__(self, run_dir: Path | None, seed: str, threads: int, verbose: bool = False, worker: int = -1, device: str = 'cpu') -> None:
+        self.device = device
         self.run_dir = run_dir
         self.seed = seed
         self.threads = threads
@@ -77,14 +107,16 @@ class Reporter:
         self.by_category: dict[str, int] = {}
 
     def finding(self, category: str, step, ins: list, msg: str, prog) -> None:  # noqa: ANN001
+        op = step.op if step is not None else 'pool'
+        if api_diff(category, op, msg, ins, step):
+            category = 'api_diff'
         self.count += 1
         self.by_category[category] = self.by_category.get(category, 0) + 1
-        op = step.op if step is not None else 'pool'
         dts = [str(v.dt).removeprefix('torch.') for v in ins]
         if step is not None:
             dts += [str(t.dtype).removeprefix('torch.') for t in step.aux.values()]
         # Coarse on purpose: one finding per distinct failure, not per input layout.
-        detail = normalize_message(msg) if category in ('mag_error', 'dtype', 'shape', 'structure', 'invariant', 'accepts_invalid') else ''
+        detail = normalize_message(msg) if category in ('mag_error', 'api_diff', 'dtype', 'shape', 'structure', 'invariant', 'accepts_invalid') else ''
         sig = f'{category}|{op}|{dts[0] if dts else "-"}|{detail}'
         key = hashlib.sha1(sig.encode()).hexdigest()[:10]
         if self.verbose:
@@ -103,21 +135,21 @@ class Reporter:
         if k is None:
             return
         stem = f'ex{k}'
-        write_report(d / f'{stem}.md', category, op, sig, msg, self.seed, prog.step_idx, self.threads, ins, step, prog.trace)
+        write_report(d / f'{stem}.md', category, op, sig, msg, self.seed, prog.step_idx, self.threads, ins, step, prog.trace, self.device)
         if step is not None:
             try:
-                write_repro(d, stem, category, step, ins, replay_command(self.seed, self.threads))
+                write_repro(d, stem, category, step, ins, replay_command(self.seed, self.threads, self.device))
             except Exception as e:  # noqa: BLE001
                 (d / f'{stem}.repro_error.txt').write_text(f'could not write repro: {type(e).__name__}: {e}\n')
 
 
-def write_report(path: Path, category: str, op: str, sig: str, msg: str, seed: str, step_idx: int, threads: int, ins: list, step, trace: list[str]) -> None:  # noqa: ANN001
+def write_report(path: Path, category: str, op: str, sig: str, msg: str, seed: str, step_idx: int, threads: int, ins: list, step, trace: list[str], device: str = 'cpu') -> None:  # noqa: ANN001
     lines = [
         f'# {category}: {op}',
         '',
         f'- signature: `{sig}`',
         f'- seed: `{seed}`, step {step_idx}, MAG_CPU_THREADS={threads}',
-        f'- replay: `{replay_command(seed, threads)}`',
+        f'- replay: `{replay_command(seed, threads, device)}`',
         '',
         '## Message',
         '```',
@@ -142,10 +174,12 @@ def _input_record(v) -> dict:  # noqa: ANN001
         return rec
     base = m.view_base if m.is_view else m
     item = ITEMSIZE[v.t.dtype]
-    if base.data_ptr == base.data_storage_ptr and base.is_contiguous:
+    if not (m.is_view or not m.is_contiguous):
+        rec['base'] = to_torch(m)  # plain contiguous tensor: store it as is, shape included
+    elif base.data_ptr == base.data_storage_ptr and base.is_contiguous:
         rec['base'] = to_torch(base).reshape(-1)
         rec['offset'] = (m.data_ptr - m.data_storage_ptr) // item
-        rec['view'] = m.is_view or not m.is_contiguous
+        rec['view'] = True
     else:
         rec['base'] = to_torch(m)
         rec['exact_layout'] = False
@@ -175,6 +209,10 @@ def write_repro(d: Path, stem: str, category: str, step, ins: list, replay: str)
     auxs = '\n'.join(f'{k} = Tensor(d["aux"]["{k}"]) if d["aux"]["{k}"].numel() else Tensor.empty(*d["aux"]["{k}"].shape, dtype=D.{TORCH2MAG[t.dtype].name})' for k, t in step.aux.items())
     xs_ref = '\n'.join(f'x{j} = d["inputs"][{j}]["ref"]' for j in range(n))
     auxs_ref = '\n'.join(f'{k} = d["aux"]["{k}"]' for k in step.aux)
+    dev = step.op.rsplit('@', 1)[1] if '@' in step.op else None
+    names = [f'x{j}' for j in range(n)] + list(step.aux)
+    dev_lines = '\n'.join(f"{k} = mirror({k}, '{dev}')" for k in names) if dev else ''
+    dev_code = f"with magnetron.device('{dev}'):\n" + textwrap.indent(step.mag, '    ') if dev else step.mag
     src = f'''\
 # magnetron-fuzz repro: {category} in {step.op}
 # Full case replay: {replay}
@@ -186,7 +224,8 @@ import torch
 from magnetron import Tensor, dtype as D
 
 from magnetron_fuzz.dtypes import to_torch
-from magnetron_fuzz.engine import Cmp, _flat, compare
+import magnetron
+from magnetron_fuzz.engine import Cmp, _flat, compare, mirror
 from magnetron_fuzz.refs import *
 
 d = torch.load(pathlib.Path(__file__).with_suffix('.pt'), weights_only=False)
@@ -202,10 +241,11 @@ def mk(e):
 # ---- magnetron ----
 {xs}
 {auxs}
+{dev_lines}
 for _n, _t in list(globals().items()):
     if isinstance(_t, Tensor) and _n[0] in 'xa':
         print(f'{{_n}}: shape={{_t.shape}} strides={{_t.strides}} dtype={{_t.dtype}}')
-{step.mag}
+{dev_code}
 mag_out = [to_torch(t) if isinstance(t, Tensor) else t for t in _flat(r)]
 
 # ---- torch reference ----

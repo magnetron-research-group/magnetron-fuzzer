@@ -107,3 +107,19 @@ def cast_mask(x: torch.Tensor, to: torch.dtype) -> torch.Tensor:
 
 
 __all__ += ['binf', 'cast_mask', 'reduce_dims']
+
+
+def nearest(x: torch.Tensor, **kw) -> torch.Tensor:
+    """Nearest(-exact) reference: torch's source-index rounding depends on the dtype (float32 math for float32 inputs), so
+    interpolate a float32 index grid and gather. This also keeps large integers exact."""
+    sp = tuple(x.shape[2:])
+    n = 1
+    for d in sp:
+        n *= d
+    grid = torch.arange(n, dtype=torch.float32).reshape(1, 1, *sp)
+    src = F.interpolate(grid, **kw).round().long()
+    flat = x.reshape(x.shape[0], x.shape[1], n)
+    return flat[:, :, src.reshape(-1)].reshape(x.shape[0], x.shape[1], *src.shape[2:])
+
+
+__all__ += ['nearest']

@@ -11,10 +11,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+import magnetron
 
 import torch
 from magnetron import Tensor, dtype as D
@@ -23,7 +26,7 @@ from . import refs
 from .dtypes import EPS, FP, ITEMSIZE, MAG2TORCH, TOLS, TORCH_WEAK, to_mag, to_torch, upcast_dtype
 from .gen import Gen
 
-MAG_NS: dict[str, object] = {'Tensor': Tensor, 'D': D, 'math': math}
+MAG_NS: dict[str, object] = {'Tensor': Tensor, 'D': D, 'math': math, 'magnetron': magnetron}
 REF_NS: dict[str, object] = {'torch': torch, 'math': math, **{k: getattr(refs, k) for k in refs.__all__}}
 
 
@@ -87,10 +90,17 @@ class Var:
         return p or id(self.t)
 
     def overlapping(self) -> bool:
-        """Some element is reachable through more than one index (expanded views)."""
-        return any(s == 0 and d > 1 for s, d in zip(self.m.strides, self.m.shape)) or any(
-            s == 0 and d > 1 for s, d in zip(self.t.stride(), self.t.shape)
-        )
+        """Some element is reachable through more than one index (expanded or overlapping strided views)."""
+        if any(s == 0 and d > 1 for s, d in zip(self.m.strides, self.m.shape)):
+            return True
+        # magnetron's layout may differ from torch's (torch.flip copies), so check magnetron's strides too: sorted by |stride|,
+        # each stride must exceed the extent spanned by all smaller ones (sufficient for no overlap).
+        span = 0
+        for s, d in sorted((abs(s), d) for s, d in zip(self.m.strides, self.m.shape) if d > 1):
+            if s <= span:
+                return True
+            span += s * (d - 1)
+        return torch._debug_has_internal_overlap(self.t) != 0  # 1 = overlaps, 2 = too complex to tell
 
     def layout(self) -> str:
         if self.numel == 0:
@@ -112,6 +122,19 @@ class CaseAbort(Exception):
     """Raised by hooks to stop the current case (e.g. replay reached its target step)."""
 
 
+def mirror(m: Tensor, device: str) -> Tensor:
+    """Bit-identical copy of a magnetron tensor on another device, keeping its strides, offset and expanded/negative layout."""
+    if m.numel == 0:
+        return Tensor.empty(*m.shape, dtype=m.dtype, device=device) if m.rank else Tensor.empty(dtype=m.dtype, device=device)
+    if m.is_view or not m.is_contiguous:
+        base = m.view_base if m.is_view else m
+        if base.data_ptr == base.data_storage_ptr and base.is_contiguous:
+            off = (m.data_ptr - m.data_storage_ptr) // ITEMSIZE[MAG2TORCH[m.dtype]]
+            b = to_mag(to_torch(base).reshape(-1)).transfer(device)
+            return b.strided_view(tuple(m.shape), tuple(m.strides), offset=off)
+    return to_mag(to_torch(m)).transfer(device)
+
+
 def _flat(r: object) -> list:
     if isinstance(r, (tuple, list)):
         out = []
@@ -122,7 +145,16 @@ def _flat(r: object) -> list:
 
 
 def _upcast(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.uint64 and t.numel() and bool((t.view(torch.int64) < 0).any()):
+        raise ValueError('uint64 values >= 2**63 have no int64 reference')  # skip instead of comparing wrapped values
     return t.to(upcast_dtype(t.dtype)) if t.dtype in TORCH_WEAK else t
+
+
+def _upcast_or_raw(t: torch.Tensor) -> torch.Tensor:
+    try:
+        return _upcast(t)
+    except ValueError:
+        return t
 
 
 def _cmp_view(t: torch.Tensor) -> torch.Tensor:
@@ -207,6 +239,7 @@ class Program:
         self.trace: list[str] = []
         self.counter = 0
         self.step_idx = 0
+        self.device: str | None = None  # second magnetron device checked on every step (e.g. 'cuda')
 
     # -- pool -------------------------------------------------------------------------------------
 
@@ -254,6 +287,8 @@ class Program:
             _, diff = self.family(ins[0])
             self.drop(diff)
         self.trace.append(f'[{self.step_idx}] {self._code(ins, step.mag)}'.replace('\n', '; '))
+        # The device run mirrors the inputs, so it must happen before the CPU run mutates them (in-place steps).
+        dev = self._run_device(step, ins) if self.device and not step.kind.startswith('smoke') else None
         if self.hooks:
             self.hooks.before_mag(self, step, ins)
 
@@ -296,6 +331,51 @@ class Program:
         if not rerr and inplace:
             rerr = self._inplace_ref_ok(ins[0], routs, upcast, mouts_t)
 
+        if dev is not None:  # before _classify: it may resync or drop the inputs
+            self._check_device(step, ins, merr, rerr, upcast, mouts_t, routs, *dev)
+        return self._classify(step, ins, inplace, merr, rerr, upcast, mouts, mouts_t, routs)
+
+    def _run_device(self, step: Step, ins: list[Var]) -> tuple[list, Exception | None]:
+        """Run the step on self.device with mirrored inputs."""
+        dstep = dataclasses.replace(step, op=f'{step.op}@{self.device}')
+        if self.hooks:
+            self.hooks.before_mag(self, dstep, ins)
+        try:
+            ns = dict(MAG_NS)
+            for j, v in enumerate(ins):
+                ns[f'x{j}'] = mirror(v.m, self.device)
+            for k, t in step.aux.items():
+                ns[k] = mirror(to_mag(t), self.device)
+            with magnetron.device(self.device):  # factories create their result on the device too
+                exec(step.mag, ns)
+            outs = [to_torch(o) if isinstance(o, Tensor) else o for o in _flat(ns['r'])]
+            err = None
+        except Exception as e:  # noqa: BLE001
+            outs, err = [], e
+        if self.hooks:
+            self.hooks.after_mag(self, dstep)
+        return outs, err
+
+    def _check_device(self, step: Step, ins: list[Var], merr, rerr, upcast: bool, mouts_t: list, routs: list, douts_t: list, derr) -> None:  # noqa: ANN001
+        """Device result vs torch; when torch has no reference, vs magnetron CPU."""
+        dstep = dataclasses.replace(step, op=f'{step.op}@{self.device}')
+        if derr is not None:
+            if merr is None and step.supported and 'not implemented in' not in str(derr):
+                self.reporter.finding('mag_error', dstep, ins, f'{type(derr).__name__}: {derr} (magnetron cpu succeeds)', self)
+            return
+        if merr is not None and rerr is not None:
+            self.reporter.finding('accepts_invalid', dstep, ins, f'{self.device} succeeds where magnetron cpu and torch raise ({merr})', self)
+            return
+        if rerr is None:
+            res = self._compare(dstep, ins, douts_t, routs, upcast)
+        else:
+            res = self._compare(dstep, ins, douts_t, mouts_t, upcast=True)
+            if res:
+                res = ('device_mismatch', f'{self.device} vs magnetron cpu (torch has no reference): {res[1]}')
+        if res:
+            self.reporter.finding(res[0], dstep, ins, res[1], self)
+
+    def _classify(self, step: Step, ins: list[Var], inplace: bool, merr, rerr, upcast: bool, mouts: list, mouts_t: list, routs: list) -> Outcome:  # noqa: ANN001
         if merr is not None and rerr is not None:
             if inplace:
                 self._check_family(step, ins[0], 'partial_write', 'in-place op raised but modified data')
@@ -366,8 +446,8 @@ class Program:
         if step.cmp.scale or step.cmp.mask:
             ns = dict(REF_NS)
             for j, v in enumerate(ins):
-                ns[f'x{j}'] = _upcast(v.t)
-            ns.update({k: _upcast(t) for k, t in step.aux.items()})
+                ns[f'x{j}'] = _upcast_or_raw(v.t)
+            ns.update({k: _upcast_or_raw(t) for k, t in step.aux.items()})
             if step.cmp.scale:
                 exec(step.cmp.scale, ns)
                 scale = ns['s']
@@ -392,6 +472,8 @@ class Program:
         if step.keep == 'one' and pairs:
             pairs = [self.gen.choice(pairs)]
         in_stores = {v.t.untyped_storage().data_ptr() for v in ins if v.numel}
+        cap = 4 * self.gen.big_numel  # keep later steps fast: huge results are checked but not reused
+        pairs = [(m, mt, r) for m, mt, r in pairs if mt.numel() <= cap]
         for m, mt, r in pairs:
             if r.numel() and r.untyped_storage().data_ptr() in in_stores and r.dtype == mt.dtype:
                 t = r  # torch view: keep aliasing so later in-place ops propagate like in magnetron.

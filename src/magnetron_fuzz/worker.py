@@ -42,6 +42,7 @@ class Config:
     max_cases: int = 0
     check_every: float = 0.1
     threads: int = 1
+    device: str = 'cpu'  # with 'cuda', every step also runs on magnetron cuda (mirrored inputs) and is checked
     launch_blocking: bool = True
     extra: dict = field(default_factory=dict)
 
@@ -100,6 +101,7 @@ def run_case(cfg: Config, seed: str, reporter, hooks, stats: dict, ops: list, on
     gen = Gen(seed, cfg.max_numel, cfg.big_numel, cfg.p_big, cfg.p_zero)
     magnetron.context.manual_seed(gen.rng.getrandbits(32))
     prog = Program(gen, reporter, hooks)
+    prog.device = cfg.device if cfg.device != 'cpu' else None
     weights = [o[1] for o in ops]
     plan = ['leaf'] * gen.randint(1, 3) + [None] * gen.randint(cfg.min_steps, cfg.max_steps)
     for planned in plan:
@@ -169,7 +171,7 @@ def worker_main(wid: int, cfg: Config, shm, opbuf, stop, start_idx: int) -> None
         seed = f'{cfg.seed}-{wid}-{idx}'
         shm[b + CASE] = idx
         shm[b + HB] = time.monotonic_ns() // 1_000_000
-        reporter = Reporter(run_dir, seed, cfg.threads, worker=wid)
+        reporter = Reporter(run_dir, seed, cfg.threads, worker=wid, device=cfg.device)
         n = run_case(cfg, seed, reporter, hooks, stats, ops, on_internal)
         shm[b + STATE] = 0
         shm[b + CASES] += 1
