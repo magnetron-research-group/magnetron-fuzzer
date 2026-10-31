@@ -89,18 +89,24 @@ class Var:
         p = self.t.untyped_storage().data_ptr() if self.t.numel() else 0
         return p or id(self.t)
 
-    def overlapping(self) -> bool:
-        """Some element is reachable through more than one index (expanded or overlapping strided views)."""
+    def m_overlapping(self) -> bool:
         if any(s == 0 and d > 1 for s, d in zip(self.m.strides, self.m.shape)):
             return True
-        # magnetron's layout may differ from torch's (torch.flip copies), so check magnetron's strides too: sorted by |stride|,
-        # each stride must exceed the extent spanned by all smaller ones (sufficient for no overlap).
+        # sorted by |stride|, each stride must exceed the extent spanned by all smaller ones (sufficient for no overlap).
         span = 0
         for s, d in sorted((abs(s), d) for s, d in zip(self.m.strides, self.m.shape) if d > 1):
             if s <= span:
                 return True
             span += s * (d - 1)
+        return False
+
+    def t_overlapping(self) -> bool:
         return torch._debug_has_internal_overlap(self.t) != 0  # 1 = overlaps, 2 = too complex to tell
+
+    def overlapping(self) -> bool:
+        """Some element is reachable through more than one index (expanded or overlapping strided views)."""
+        # magnetron's layout may differ from torch's (torch.flip copies), so check both sides.
+        return self.m_overlapping() or self.t_overlapping()
 
     def layout(self) -> str:
         if self.numel == 0:
@@ -265,7 +271,9 @@ class Program:
         same, diff = [], []
         for w in self.pool:
             a, b = w.mstore() == ms, w.tstore() == ts
-            if a and b:
+            # a torch copy of a self-overlapping magnetron view (flip of an expand) aliases its views without the overlap:
+            # writes through them update one copy of each element on the torch side but every index in magnetron.
+            if a and b and w.m_overlapping() == w.t_overlapping():
                 same.append(w)
             elif a or b:
                 diff.append(w)
