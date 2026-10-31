@@ -385,11 +385,9 @@ UNARY: list[tuple[str, frozenset, str]] = [
     ('erf', FP, 'f64(x0, torch.erf)'), ('erfc', FP, 'f64(x0, torch.erfc)'), ('exp', FP, 'f64(x0, torch.exp)'),
     ('exp2', FP, 'f64(x0, torch.exp2)'), ('expm1', FP, 'f64(x0, torch.expm1)'), ('floor', FP, 'f64(x0, torch.floor)'),
     ('ceil', FP, 'f64(x0, torch.ceil)'), ('round', FP, 'f64(x0, torch.round)'), ('trunc', FP, 'f64(x0, torch.trunc)'),
-    ('softmax_dv', FP, 'f64(x0, softmax_dv)'), ('sigmoid', FP, 'f64(x0, torch.sigmoid)'), ('sigmoid_dv', FP, 'f64(x0, sigmoid_dv)'),
-    ('hard_sigmoid', FP, 'f64(x0, F.hardsigmoid)'), ('silu', FP, 'f64(x0, F.silu)'), ('silu_dv', FP, 'f64(x0, silu_dv)'),
-    ('tanh_dv', FP, 'f64(x0, tanh_dv)'), ('relu', FP, 'f64(x0, torch.relu)'), ('relu_dv', FP, 'f64(x0, step)'),
-    ('gelu', FP, 'f64(x0, F.gelu)'), ('gelu_approx', FP, "f64(x0, lambda v: F.gelu(v, approximate='tanh'))"),
-    ('gelu_dv', FP, 'f64(x0, gelu_dv)'), ('logical_not', INTEGRAL, 'bitnot(x0)'),
+    ('sigmoid', FP, 'f64(x0, torch.sigmoid)'), ('hard_sigmoid', FP, 'f64(x0, F.hardsigmoid)'), ('silu', FP, 'f64(x0, F.silu)'),
+    ('relu', FP, 'f64(x0, torch.relu)'), ('gelu', FP, 'f64(x0, F.gelu)'), ('gelu_approx', FP, "f64(x0, lambda v: F.gelu(v, approximate='tanh'))"),
+    ('logical_not', INTEGRAL, 'bitnot(x0)'),
 ]  # fmt: skip
 # Periodic functions lose absolute accuracy proportional to |x| during range reduction.
 RANGE_REDUCED = {'sin', 'cos', 'tan'}
@@ -729,7 +727,7 @@ def reduce(p: Program) -> Step | None:
     if name == 'prod':
         ref = f'r = reduce_dims(torch.prod, x0, {dims!r}, {keep})' if dims is not None else 'r = torch.prod(x0)'
         if x.dt in FP:
-            ref = f'r = reduce_dims(torch.prod, x0.double(), {dims!r}, {keep}).to(x0.dtype)'
+            ref = f'r = prod_exact(x0, {dims!r}, {keep}).to(x0.dtype)'
         return Step(name, [i], mag, ref, cmp=Cmp(rtol_mul=1 + n / 2), supported=supported)
     if name in ('all', 'any'):
         return Step(name, [i], mag, f'r = torch.{name}(x0{tkw})', cmp=Cmp(check_dtype=x.dt != torch.uint8), supported=supported)

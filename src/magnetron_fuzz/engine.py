@@ -202,7 +202,28 @@ def _fmt_bad(got: torch.Tensor, exp: torch.Tensor, eq: torch.Tensor) -> str:
 F32_MAX = torch.finfo(torch.float32).max
 
 
-def compare(got: torch.Tensor, exp: torch.Tensor, cmp: Cmp, *, upcast: bool, scale: torch.Tensor | None = None, mask: torch.Tensor | None = None) -> tuple[str, str] | None:
+def _zero_nonfinite(t: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0) if t.dtype.is_floating_point else t
+
+
+def _finite_overflow(step: Step, ins: list) -> torch.Tensor | None:
+    """Elements whose finite terms alone have magnitudes summing past the float32 accumulator range: partial sums can
+    overflow to either signed inf (then meet an input inf as inf - inf = NaN) depending on the reduction order, so inf,
+    NaN and near-max results are all legitimate there. Non-finite inputs are zeroed, as they do not depend on order."""
+    ns = dict(REF_NS)
+    for j, v in enumerate(ins):
+        ns[f'x{j}'] = _zero_nonfinite(_upcast_or_raw(v.t))
+    ns.update({k: _zero_nonfinite(_upcast_or_raw(t)) for k, t in step.aux.items()})
+    try:
+        exec(step.cmp.scale, ns)
+    except Exception:  # noqa: BLE001
+        return None
+    return ns['s'].double() > F32_MAX
+
+
+def compare(
+    got: torch.Tensor, exp: torch.Tensor, cmp: Cmp, *, upcast: bool, scale: torch.Tensor | None = None, mask: torch.Tensor | None = None, overflow: torch.Tensor | None = None
+) -> tuple[str, str] | None:
     """(category, message) on mismatch, else None."""
     if tuple(got.shape) != tuple(exp.shape):
         return 'shape', f'shape mismatch: magnetron {tuple(got.shape)} vs torch {tuple(exp.shape)}'
@@ -223,11 +244,8 @@ def compare(got: torch.Tensor, exp: torch.Tensor, cmp: Cmp, *, upcast: bool, sca
             tol = tol + cmp.acc_k * EPS[got.dtype] * torch.nan_to_num(scale.double(), nan=math.inf)
         close = (((a - b).abs() <= tol) & torch.isfinite(a) & torch.isfinite(b)) | (a == b)
         eq = close | (torch.isnan(a) & torch.isnan(b)) | ((a == b) & torch.isinf(b))
-        if scale is not None:
-            # Finite terms whose magnitudes sum past the float32 accumulator range: partial sums overflow to inf/NaN in an
-            # order-dependent way (tree vs sequential), so inf, NaN and near-max results are all legitimate here.
-            s = scale.double()
-            eq = eq | (torch.isfinite(s) & (s > F32_MAX))
+        if overflow is not None:
+            eq = eq | overflow
     if mask is not None:
         eq = eq | ~mask
     if bool(eq.all()):
@@ -462,7 +480,7 @@ class Program:
             if not res:
                 return None
             return res if isinstance(res, tuple) else ('mismatch', res)
-        scale = mask = None
+        scale = mask = overflow = None
         if step.cmp.scale or step.cmp.mask:
             ns = dict(REF_NS)
             for j, v in enumerate(ins):
@@ -471,6 +489,7 @@ class Program:
             if step.cmp.scale:
                 exec(step.cmp.scale, ns)
                 scale = ns['s']
+                overflow = _finite_overflow(step, ins)
             if step.cmp.mask:
                 exec(step.cmp.mask, ns)
                 mask = ns['m']
@@ -479,7 +498,7 @@ class Program:
                 if a != b:
                     return 'mismatch', f'output {i}: magnetron {a!r} vs torch {b!r}'
                 continue
-            res = compare(a, b, step.cmp, upcast=upcast, scale=scale if i == 0 else None, mask=mask if i == 0 else None)
+            res = compare(a, b, step.cmp, upcast=upcast, scale=scale if i == 0 else None, mask=mask if i == 0 else None, overflow=overflow if i == 0 else None)
             if res:
                 cat, msg = res
                 return cat, (f'output {i}: ' if len(mouts_t) > 1 else '') + msg

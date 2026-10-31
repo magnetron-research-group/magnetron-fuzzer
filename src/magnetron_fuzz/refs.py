@@ -24,32 +24,6 @@ def f64(x: torch.Tensor, fn) -> torch.Tensor:  # noqa: ANN001
     return fn(x)
 
 
-def softmax_dv(x: torch.Tensor) -> torch.Tensor:
-    if x.dim() == 0:
-        return torch.zeros_like(x)
-    s = torch.softmax(x, -1)
-    return s * (1 - s)
-
-
-def sigmoid_dv(x: torch.Tensor) -> torch.Tensor:
-    s = torch.sigmoid(x)
-    return s * (1 - s)
-
-
-def silu_dv(x: torch.Tensor) -> torch.Tensor:
-    s = torch.sigmoid(x)
-    return s + x * s * (1 - s)
-
-
-def tanh_dv(x: torch.Tensor) -> torch.Tensor:
-    t = torch.tanh(x)
-    return 1 - t * t
-
-
-def gelu_dv(x: torch.Tensor) -> torch.Tensor:
-    return 0.5 * (1 + torch.erf(x * 0.7071067811865476)) + x * 0.3989422804014327 * torch.exp(-0.5 * x * x)
-
-
 def step(x: torch.Tensor) -> torch.Tensor:
     return (x > 0).to(x.dtype)
 
@@ -66,7 +40,7 @@ def clamp_shift(y: torch.Tensor, bits: int) -> torch.Tensor:
     return y.abs() % bits
 
 
-__all__ = ['F', 'bitnot', 'clamp_shift', 'f64', 'gelu_dv', 'sigmoid_dv', 'silu_dv', 'softmax', 'softmax_dv', 'step', 'tanh_dv', 'torch']
+__all__ = ['F', 'bitnot', 'clamp_shift', 'f64', 'softmax', 'step', 'torch']
 
 
 def binf(op, a, b):  # noqa: ANN001, ANN201
@@ -106,7 +80,30 @@ def cast_mask(x: torch.Tensor, to: torch.dtype) -> torch.Tensor:
     return torch.ones(x.shape, dtype=torch.bool)
 
 
-__all__ += ['binf', 'cast_mask', 'reduce_dims']
+def prod_exact(x: torch.Tensor, dims, keepdim: bool) -> torch.Tensor:  # noqa: ANN001
+    """Float product over dims tracked as mantissa * 2^exponent: no partial product overflows to inf (then inf*0 = NaN)
+    or flushes to 0, so the result is the order-independent value a reordered (tree) reduction should produce."""
+    nd = x.dim()
+    red = list(range(nd)) if dims is None else sorted({d % nd for d in ((dims,) if isinstance(dims, int) else dims)})
+    keep = [d for d in range(nd) if d not in red]
+    flat = x.double().permute(keep + red).reshape([x.shape[d] for d in keep] + [-1])
+    m, e = torch.frexp(flat)
+    am, ae = torch.ones(flat.shape[:-1], dtype=torch.float64), torch.zeros(flat.shape[:-1], dtype=torch.int64)
+    for i in range(flat.shape[-1]):
+        am, k = torch.frexp(am * m[..., i])
+        ae = ae + e[..., i] + k
+    ae = ae.clamp(-3000, 3000)
+    third = torch.div(ae, 3, rounding_mode='trunc')
+    r = torch.ldexp(torch.ldexp(torch.ldexp(am, third), third), ae - 2 * third)  # each factor stays finite
+    if keepdim and dims is not None:
+        for d in red:
+            r = r.unsqueeze(d)
+    elif keepdim:
+        r = r.reshape([1] * nd)
+    return r
+
+
+__all__ += ['binf', 'cast_mask', 'prod_exact', 'reduce_dims']
 
 
 def nearest(x: torch.Tensor, **kw) -> torch.Tensor:
