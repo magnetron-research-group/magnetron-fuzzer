@@ -145,7 +145,8 @@ def recheck(a: argparse.Namespace) -> int:
     def category_still(cat: str, got: str) -> str | None:
         return got if cat in ('hang',) else f'now {got}'
 
-    results = list(ThreadPoolExecutor(max_workers=max(1, a.jobs)).map(one, cases))
+    jobs = a.jobs or (4 if saved.get('device', 'cpu') == 'cuda' else os.cpu_count() or 1)
+    results = list(ThreadPoolExecutor(max_workers=max(1, jobs)).map(one, cases))
     still = [(c, why) for c, why in results if why]
     by_cat = Counter(c[1] for c, _ in results)
     left = Counter(c[1] for c, _ in still)

@@ -46,6 +46,8 @@ support is a finding. An error on an unsupported dtype only exercises input vali
 | `mag_error`       | magnetron raised on an input it claims to support                               |
 | `accepts_invalid` | magnetron accepted an invalid input (e.g. out-of-range index) that torch rejects |
 | `invariant`       | A random op produced output violating its invariants (range, distribution)      |
+| `device_mismatch` | `--device cuda`: CUDA differs from magnetron CPU where torch has no reference   |
+| `api_diff`        | Known, intentional difference from torch semantics (see `KNOWN_API_DIFFS`)       |
 
 Findings are deduplicated by a signature made of category, op, dtypes, input layout and a normalized error
 message. Each unique signature keeps at most 3 examples on disk.
@@ -105,6 +107,9 @@ it prints a per-op outcome table and the top findings, ordered by severity and t
 | `--ops` / `--skip-ops` | —                 | Regex filter on op family names                                 |
 | `--timeout`            | `60`              | Seconds without progress before a worker counts as hung         |
 | `--no-replay`          | off               | Don't replay crashes and hangs to produce repro scripts         |
+| `--device`             | `cpu`             | `cuda`: also run every step on magnetron CUDA and check it against torch (and magnetron CPU); defaults to 4 workers |
+| `--async-every`        | `4`               | Every Nth worker runs with async CPU execution; the others use `MAG_LAUNCH_BLOCKING=1` for exact crash attribution |
+| `--recheck RUN_DIR`    | —                 | Replay one example per finding of an earlier run and report which still fail |
 
 ## Reproducing findings
 

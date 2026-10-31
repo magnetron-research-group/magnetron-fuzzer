@@ -177,7 +177,7 @@ def _input_record(v) -> dict:  # noqa: ANN001
     item = ITEMSIZE[v.t.dtype]
     if not (m.is_view or not m.is_contiguous):
         rec['base'] = to_torch(m)  # plain contiguous tensor: store it as is, shape included
-    elif base.data_ptr == base.data_storage_ptr and base.is_contiguous:
+    elif base.data_ptr == base.data_storage_ptr and base.is_contiguous and base.dtype == m.dtype:  # not after reinterpret_view
         rec['base'] = to_torch(base).reshape(-1)
         rec['offset'] = (m.data_ptr - m.data_storage_ptr) // item
         rec['view'] = True
@@ -195,7 +195,7 @@ def write_repro(d: Path, stem: str, category: str, step, ins: list, replay: str)
         if rec['view']:
             try:
                 rebuilt = Tensor(rec['base']).strided_view(rec['shape'], rec['strides'], offset=rec['offset'])
-                if not torch.equal(to_torch(rebuilt).view(torch.uint8), to_torch(v.m).view(torch.uint8)) or tuple(rebuilt.strides) != rec['strides']:
+                if not torch.equal(to_torch(rebuilt).view(torch.uint8), to_torch(v.m).view(torch.uint8)) or tuple(rebuilt.strides) != rec['strides'] or rebuilt.dtype != v.m.dtype:
                     rec['exact_layout'] = False
             except Exception:  # noqa: BLE001
                 rec['exact_layout'] = False

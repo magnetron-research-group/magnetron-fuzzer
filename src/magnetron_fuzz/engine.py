@@ -128,7 +128,8 @@ def mirror(m: Tensor, device: str) -> Tensor:
         return Tensor.empty(*m.shape, dtype=m.dtype, device=device) if m.rank else Tensor.empty(dtype=m.dtype, device=device)
     if m.is_view or not m.is_contiguous:
         base = m.view_base if m.is_view else m
-        if base.data_ptr == base.data_storage_ptr and base.is_contiguous:
+        # base.dtype differs from m.dtype after reinterpret_view: a strided view of it would carry the base dtype
+        if base.data_ptr == base.data_storage_ptr and base.is_contiguous and base.dtype == m.dtype:
             off = (m.data_ptr - m.data_storage_ptr) // ITEMSIZE[MAG2TORCH[m.dtype]]
             b = to_mag(to_torch(base).reshape(-1)).transfer(device)
             return b.strided_view(tuple(m.shape), tuple(m.strides), offset=off)
