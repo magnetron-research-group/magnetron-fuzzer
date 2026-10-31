@@ -199,6 +199,9 @@ def _fmt_bad(got: torch.Tensor, exp: torch.Tensor, eq: torch.Tensor) -> str:
     return '\n'.join(lines)
 
 
+F32_MAX = torch.finfo(torch.float32).max
+
+
 def compare(got: torch.Tensor, exp: torch.Tensor, cmp: Cmp, *, upcast: bool, scale: torch.Tensor | None = None, mask: torch.Tensor | None = None) -> tuple[str, str] | None:
     """(category, message) on mismatch, else None."""
     if tuple(got.shape) != tuple(exp.shape):
@@ -220,6 +223,11 @@ def compare(got: torch.Tensor, exp: torch.Tensor, cmp: Cmp, *, upcast: bool, sca
             tol = tol + cmp.acc_k * EPS[got.dtype] * torch.nan_to_num(scale.double(), nan=math.inf)
         close = (((a - b).abs() <= tol) & torch.isfinite(a) & torch.isfinite(b)) | (a == b)
         eq = close | (torch.isnan(a) & torch.isnan(b)) | ((a == b) & torch.isinf(b))
+        if scale is not None:
+            # Finite terms whose magnitudes sum past the float32 accumulator range: partial sums overflow to inf/NaN in an
+            # order-dependent way (tree vs sequential), so inf, NaN and near-max results are all legitimate here.
+            s = scale.double()
+            eq = eq | (torch.isfinite(s) & (s > F32_MAX))
     if mask is not None:
         eq = eq | ~mask
     if bool(eq.all()):
