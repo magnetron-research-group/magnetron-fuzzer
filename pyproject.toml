@@ -8,7 +8,10 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "magnetron>=0.2.2",
+    "magnetron>=0.2.3",
+    "numpy>=2.5.4",
+    "pytest>=9.2.0",
+    "pytest-xdist>=3.8.0",
     "torch>=2.15.0",
 ]
 
@@ -19,6 +22,5 @@ magnetron-fuzz = "magnetron_fuzz:main"
 requires = ["uv_build>=0.13.4,<0.14.0"]
 build-backend = "uv_build"
 
-[tool.uv.sources]
-# Use the local checkout until the next magnetron release.
-magnetron = { path = "../magnetron", editable = true }
+[tool.uv] # We always want to use latest magnetron
+upgrade-package = ["magnetron"]
